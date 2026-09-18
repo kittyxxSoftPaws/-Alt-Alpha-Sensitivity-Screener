@@ -1,0 +1,269 @@
+//@version=6
+// Alt Alpha & Sensitivity Screener  (v5 — auto cohort map + 24h change)
+// ------------------------------------------------------------
+// Pine Screener hard limits (TradingView help center, "Pine Screener requirements"):
+//   * max FIVE request.*() calls in the scanned script       -> v3's 32 calls = blank table
+//   * input.symbol() is ignored; script defaults are used    -> symbols are constants here
+//   * only the LAST 500 BARS are calculated                  -> defaults shrunk to fit
+//   * only the FIRST TEN plots become columns automatically  -> plot order matters
+//
+// Request budget (5): BTC + four cohort legs. No OI request — read OI in MMT.
+//
+// Cohort = a preset basket chosen in Settings. One scan per basket answers
+// "who has alpha vs THIS group". A per-asset adaptive cohort needs ~30 requests
+// and lives in the chart-side companion script, not here.
+//
+// Factor model (through-origin regressions, close-to-close returns in bps):
+//   res1 = alt return - beta(alt on BTC) * BTC return               (1F residual)
+//   coh  = mean(leg returns) - beta(mean on BTC) * BTC return       (cohort residual)
+//   res2 = res1 - loading * coh                                     (2F residual = alpha)
+// ------------------------------------------------------------
+indicator("Alt Alpha & Sensitivity Screener", shorttitle = "AltScreen", overlay = false, dynamic_requests = true)
+
+// ---------------- Model inputs (sized for the 500-bar screener window) ----------------
+win     = input.int(144,  "Regression window (bars)",        minval = 20, maxval = 300, group = "Model")
+aWin    = input.int(72,   "Alpha lookback (bars)",           minval = 12, maxval = 150, group = "Model")
+slopeN  = input.int(24,   "Beta slope lookback (bars)",      minval = 2,  maxval = 100, group = "Model")
+impK    = input.float(1.5,"Impulse threshold (x BTC rvol)",  step = 0.1,  group = "Model")
+rvShort = input.int(24,   "Realized vol short window",       minval = 5,  group = "Model")
+rvLong  = input.int(144,  "Realized vol long window",        minval = 20, maxval = 300, group = "Model")
+
+// ---------------- Cohort selection ----------------
+// "Auto" assigns each scanned symbol a sector basket from the map below, so one scan
+// covers the whole watchlist with each name measured against its own group.
+// Any other choice forces that basket for every symbol (useful for "who beats the
+// majors" style scans). Unmapped names fall back to Majors.
+preset = input.string("Auto", "Cohort basket",
+     options = ["Auto", "Legacy L1", "Majors", "L2 / New L1", "DeFi", "Memes", "AI"], group = "Cohort")
+
+// Sector map keyed on syminfo.ticker (e.g. "AVAXUSDT.P"). Extend freely.
+f_sector(t) =>
+    switch t
+        // Legacy L1 / infra (2020-21 era rotation)
+        "AVAXUSDT.P" => "Legacy L1"
+        "DOTUSDT.P"  => "Legacy L1"
+        "HBARUSDT.P" => "Legacy L1"
+        "ICPUSDT.P"  => "Legacy L1"
+        "INJUSDT.P"  => "Legacy L1"
+        "ADAUSDT.P"  => "Legacy L1"
+        "ALGOUSDT.P" => "Legacy L1"
+        "ATOMUSDT.P" => "Legacy L1"
+        "NEARUSDT.P" => "Legacy L1"
+        "FILUSDT.P"  => "Legacy L1"
+        "XLMUSDT.P"  => "Legacy L1"
+        "ETCUSDT.P"  => "Legacy L1"
+        "VETUSDT.P"  => "Legacy L1"
+        "EOSUSDT.P"  => "Legacy L1"
+        "XTZUSDT.P"  => "Legacy L1"
+        "EGLDUSDT.P" => "Legacy L1"
+        "THETAUSDT.P"=> "Legacy L1"
+        "FLOWUSDT.P" => "Legacy L1"
+        "KAVAUSDT.P" => "Legacy L1"
+        "MINAUSDT.P" => "Legacy L1"
+        // Majors
+        "ETHUSDT.P"  => "Majors"
+        "SOLUSDT.P"  => "Majors"
+        "XRPUSDT.P"  => "Majors"
+        "BNBUSDT.P"  => "Majors"
+        "LTCUSDT.P"  => "Majors"
+        "BCHUSDT.P"  => "Majors"
+        "TRXUSDT.P"  => "Majors"
+        "TONUSDT.P"  => "Majors"
+        // L2 / new L1
+        "ARBUSDT.P"  => "L2 / New L1"
+        "OPUSDT.P"   => "L2 / New L1"
+        "SUIUSDT.P"  => "L2 / New L1"
+        "APTUSDT.P"  => "L2 / New L1"
+        "SEIUSDT.P"  => "L2 / New L1"
+        "TIAUSDT.P"  => "L2 / New L1"
+        "STRKUSDT.P" => "L2 / New L1"
+        "ZKUSDT.P"   => "L2 / New L1"
+        "MNTUSDT.P"  => "L2 / New L1"
+        "POLUSDT.P"  => "L2 / New L1"
+        "SUSDT.P"    => "L2 / New L1"
+        "BERAUSDT.P" => "L2 / New L1"
+        "MOVEUSDT.P" => "L2 / New L1"
+        // DeFi
+        "AAVEUSDT.P" => "DeFi"
+        "UNIUSDT.P"  => "DeFi"
+        "LINKUSDT.P" => "DeFi"
+        "ENAUSDT.P"  => "DeFi"
+        "LDOUSDT.P"  => "DeFi"
+        "CRVUSDT.P"  => "DeFi"
+        "PENDLEUSDT.P" => "DeFi"
+        "JUPUSDT.P"  => "DeFi"
+        "RAYUSDT.P"  => "DeFi"
+        "CAKEUSDT.P" => "DeFi"
+        "COMPUSDT.P" => "DeFi"
+        "SNXUSDT.P"  => "DeFi"
+        "DYDXUSDT.P" => "DeFi"
+        "GMXUSDT.P"  => "DeFi"
+        "ONDOUSDT.P" => "DeFi"
+        "SYRUPUSDT.P"=> "DeFi"
+        "MORPHOUSDT.P" => "DeFi"
+        "HYPEUSDT.P" => "DeFi"
+        "1INCHUSDT.P" => "DeFi"
+        // Memes
+        "DOGEUSDT.P" => "Memes"
+        "1000PEPEUSDT.P" => "Memes"
+        "WIFUSDT.P"  => "Memes"
+        "1000SHIBUSDT.P" => "Memes"
+        "1000BONKUSDT.P" => "Memes"
+        "1000FLOKIUSDT.P" => "Memes"
+        "PUMPUSDT.P" => "Memes"
+        "TRUMPUSDT.P" => "Memes"
+        "FARTCOINUSDT.P" => "Memes"
+        "BRETTUSDT.P" => "Memes"
+        "POPCATUSDT.P" => "Memes"
+        "NEIROUSDT.P" => "Memes"
+        "DOGSUSDT.P" => "Memes"
+        "PNUTUSDT.P" => "Memes"
+        "MOODENGUSDT.P" => "Memes"
+        "SPXUSDT.P"  => "Memes"
+        "USELESSUSDT.P" => "Memes"
+        // AI
+        "TAOUSDT.P"  => "AI"
+        "FETUSDT.P"  => "AI"
+        "RENDERUSDT.P" => "AI"
+        "WLDUSDT.P"  => "AI"
+        "VIRTUALUSDT.P" => "AI"
+        "GRTUSDT.P"  => "AI"
+        "AI16ZUSDT.P" => "AI"
+        "ARKMUSDT.P" => "AI"
+        "IOUSDT.P"   => "AI"
+        "AIXBTUSDT.P" => "AI"
+        => "Majors"
+
+sector = preset == "Auto" ? f_sector(syminfo.ticker) : preset
+
+// Symbols are constants by design: input.symbol() is ignored in Pine Screener.
+// Every leg must exist on Binance USDT-M.
+BTC = "BINANCE:BTCUSDT.P"
+[L1, L2, L3, L4] = switch sector
+    "Legacy L1"   => ["BINANCE:DOTUSDT.P",  "BINANCE:HBARUSDT.P",     "BINANCE:ICPUSDT.P",    "BINANCE:INJUSDT.P"]
+    "Majors"      => ["BINANCE:ETHUSDT.P",  "BINANCE:SOLUSDT.P",      "BINANCE:XRPUSDT.P",    "BINANCE:BNBUSDT.P"]
+    "L2 / New L1" => ["BINANCE:ARBUSDT.P",  "BINANCE:OPUSDT.P",       "BINANCE:SUIUSDT.P",    "BINANCE:APTUSDT.P"]
+    "DeFi"        => ["BINANCE:AAVEUSDT.P", "BINANCE:UNIUSDT.P",      "BINANCE:LINKUSDT.P",   "BINANCE:ENAUSDT.P"]
+    "Memes"       => ["BINANCE:DOGEUSDT.P", "BINANCE:1000PEPEUSDT.P", "BINANCE:WIFUSDT.P",    "BINANCE:1000SHIBUSDT.P"]
+    => ["BINANCE:TAOUSDT.P", "BINANCE:FETUSDT.P", "BINANCE:RENDERUSDT.P", "BINANCE:WLDUSDT.P"]
+
+// Numeric code for the sector so it can be a column (strings cannot be plotted).
+sectorId = sector == "Legacy L1" ? 1 : sector == "Majors" ? 2 : sector == "L2 / New L1" ? 3 : sector == "DeFi" ? 4 : sector == "Memes" ? 5 : 6
+
+// ---------------- Helpers ----------------
+f_ret(c)        => (c / math.max(c[1], 1e-8) - 1) * 10000
+f_beta(y, x, n) => ta.sma(y * x, n) / math.max(ta.sma(x * x, n), 1e-4)
+f_req(sym)      => request.security(sym, timeframe.period, f_ret(close), ignore_invalid_symbol = true)
+
+// ---------------- The five requests ----------------
+altRet = f_ret(close)
+btcRet = request.security(BTC, timeframe.period, f_ret(close))
+r1 = f_req(L1)
+r2 = f_req(L2)
+r3 = f_req(L3)
+r4 = f_req(L4)
+
+// Cohort basket: equal-weight over legs that returned data; a scanned name that is
+// itself a leg is excluded so it is never regressed on itself.
+self1 = syminfo.tickerid == L1
+self2 = syminfo.tickerid == L2
+self3 = syminfo.tickerid == L3
+self4 = syminfo.tickerid == L4
+u1 = not self1 and not na(r1)
+u2 = not self2 and not na(r2)
+u3 = not self3 and not na(r3)
+u4 = not self4 and not na(r4)
+nLegs  = (u1 ? 1 : 0) + (u2 ? 1 : 0) + (u3 ? 1 : 0) + (u4 ? 1 : 0)
+cohRet = nLegs > 0 ? ((u1 ? r1 : 0.0) + (u2 ? r2 : 0.0) + (u3 ? r3 : 0.0) + (u4 ? r4 : 0.0)) / nLegs : na
+
+// ---------------- Factor model ----------------
+btcBeta = f_beta(altRet, btcRet, win)
+res1    = altRet - btcBeta * btcRet
+cohB    = f_beta(cohRet, btcRet, win)
+cohRes  = cohRet - cohB * btcRet
+gam     = f_beta(res1, cohRes, win)
+res2    = res1 - gam * cohRes
+
+// ---------------- Alpha t-stats ----------------
+f_tstat(r, n) =>
+    m = ta.sma(r, n)
+    s = ta.stdev(r, n)
+    na(m) or na(s) ? na : s > 0 ? m / (s / math.sqrt(n)) : 0.0
+
+tBTC = f_tstat(res1, aWin)
+t2F  = f_tstat(res2, aWin)
+
+// ---------------- Persistence / emergence ----------------
+third   = math.max(math.floor(aWin / 3), 2)
+sumT    = math.sum(res2, third)
+s1      = sumT
+s2      = sumT[third]
+s3      = sumT[2 * third]
+sg1     = math.sign(s1)
+persist = na(s1) or na(s2) or na(s3) ? na : sg1 * (1 + (math.sign(s2) == sg1 ? 1 : 0) + (math.sign(s3) == sg1 ? 1 : 0))
+emerge  = na(persist) ? na : (math.sign(s2) == sg1 and math.sign(s3) != sg1) ? sg1 : 0
+
+// ---------------- Alpha on volume vs thin ----------------
+relVol    = volume / math.max(ta.sma(volume, win), 1e-8)
+resReal   = relVol >= 1 ? res2 : 0.0
+resThin   = relVol <  1 ? res2 : 0.0
+alphaReal = na(res2) ? na : math.sum(resReal, aWin)
+alphaThin = na(res2) ? na : math.sum(resThin, aWin)
+
+// ---------------- Sensitivity: impulse vs quiet beta ----------------
+btcRV   = ta.stdev(btcRet, rvLong)
+isImp   = math.abs(btcRet) > impK * btcRV
+impXY   = isImp ? altRet * btcRet : 0.0
+impXX   = isImp ? btcRet * btcRet : 0.0
+qXY     = isImp ? 0.0 : altRet * btcRet
+qXX     = isImp ? 0.0 : btcRet * btcRet
+sImpXX  = math.sum(impXX, win)
+sQXX    = math.sum(qXX, win)
+betaImp = sImpXX > 0 ? math.sum(impXY, win) / sImpXX : na
+betaQ   = sQXX   > 0 ? math.sum(qXY, win)   / sQXX   : na
+amp     = na(betaImp) or na(betaQ) ? na : betaImp / math.max(math.abs(betaQ), 0.25)
+nImp    = math.sum(isImp ? 1 : 0, win)
+
+// ---------------- Beta slope ----------------
+bSlope = btcBeta - btcBeta[slopeN]
+
+// ---------------- Coil ----------------
+altRVs   = ta.stdev(altRet, rvShort)
+altRVl   = ta.stdev(altRet, rvLong)
+volRatio = altRVs / math.max(altRVl, 1e-4)
+altImp   = math.abs(altRet) > impK * altRVl
+sinceImp = nz(ta.barssince(altImp), 0)
+coil     = (1 - volRatio) * sinceImp
+
+// ---------------- 24h change (no request slot needed) ----------------
+// Bars in 24h on the current timeframe; on 1D this is one bar, on 1W/1M it degrades to one bar.
+bars24 = math.max(1, math.round(86400.0 / timeframe.in_seconds()))
+chg24  = (close / math.max(close[bars24], 1e-8) - 1) * 100
+
+// ---------------- Columns ----------------
+// First ten plots auto-populate the table; the rest are toggled on via the table's
+// column button. Regression outputs are blank until `win` bars have accumulated.
+warm = bar_index >= win
+f_w(v) => warm ? v : na
+
+// --- auto columns (10) ---
+plot(chg24,          "Chg 24h %")
+plot(f_w(btcBeta),   "Beta BTC")
+plot(f_w(tBTC),      "Alpha t (vs BTC)")
+plot(f_w(gam),       "Cohort loading")
+plot(f_w(t2F),       "Alpha t (2F)")
+plot(f_w(emerge),    "Emerging (+/-1)")
+plot(f_w(alphaReal), "Alpha on volume bps")
+plot(f_w(alphaThin), "Alpha on thin bps")
+plot(f_w(amp),       "Amplification")
+plot(coil,           "Coil")
+// --- optional columns ---
+plot(f_w(persist),   "Persist (-3..3)")
+plot(f_w(betaImp),   "Beta impulse")
+plot(f_w(betaQ),     "Beta quiet")
+plot(f_w(nImp),      "Impulse bars in window")
+plot(f_w(bSlope),    "Beta slope")
+plot(volRatio,       "Vol ratio short/long")
+plot(sinceImp,       "Bars since own impulse")
+plot(sectorId,       "Sector (1 L1, 2 Maj, 3 L2, 4 DeFi, 5 Meme, 6 AI)")
+plot(nLegs,          "Cohort legs live")
